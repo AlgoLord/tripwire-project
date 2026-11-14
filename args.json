@@ -1,0 +1,9 @@
+{
+  "verifier_pk": "REPLACE_WITH_DEDICATED_SENTRY_PUBLIC_KEY",
+  "mpc_contract_id": "v1.signer-prod.testnet",
+  "initial_policy": {
+    "max_eth_transfer": "1000000000000000000",
+    "allowed_delegates": [],
+    "forbidden_spenders": []
+  }
+}

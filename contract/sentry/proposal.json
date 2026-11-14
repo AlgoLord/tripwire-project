@@ -1,0 +1,8 @@
+{
+  "action": "execute",
+  "target": "v3.tripwire-admin.testnet",
+  "nonce": 1,
+  "payload": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+  "payloadHashHex": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+  "derivationPath": "near,v3.tripwire-admin.testnet"
+}

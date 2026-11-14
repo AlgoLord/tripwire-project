@@ -1,0 +1,16 @@
+{
+  "name": "tripwire-verifier-compat",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "build": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@near-js/crypto": "^2.5.1",
+    "ethers": "^6.17.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.8.3"
+  }
+}
