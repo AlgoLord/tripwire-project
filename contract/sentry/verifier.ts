@@ -1,5 +1,5 @@
 import { sha256 } from '@noble/hashes/sha256';
-import { utf8ToBytes } from '@noble/hashes/utils';
+import { utf8ToBytes, hexToBytes } from '@noble/hashes/utils';
 import { ec as EC } from 'elliptic';
 
 const ec = new EC('secp256k1');
@@ -17,6 +17,11 @@ export interface VerdictPayload {
   policyHash: Uint8Array; // 32 bytes
 }
 
+/**
+ * Borsh serialization for PolicyConfig matching Rust contract byte-for-byte:
+ * - max_amount: u128 (16 bytes, little-endian)
+ * - to_address: String (4 bytes LE length + UTF-8 bytes)
+ */
 export function serializePolicy(policy: PolicyConfig): Uint8Array {
   const amountBuf = new Uint8Array(16);
   const amtBig = BigInt(policy.max_amount);
@@ -38,6 +43,14 @@ export function hashPolicy(policy: PolicyConfig): Uint8Array {
   return sha256(serializePolicy(policy));
 }
 
+/**
+ * Canonical Borsh verdict message serialization matching Rust contract:
+ * - domain: String
+ * - nonce: u64 (8 bytes LE)
+ * - payload_hash: [u8; 32]
+ * - derivation_path: String (raw UTF-8 bytes without string length prefix)
+ * - policy_hash: [u8; 32]
+ */
 export function serializeVerdict(verdict: VerdictPayload): Uint8Array {
   const domainBytes = utf8ToBytes(verdict.domain);
   const domainLen = new Uint8Array(4);
@@ -46,15 +59,21 @@ export function serializeVerdict(verdict: VerdictPayload): Uint8Array {
   const nonceBuf = new Uint8Array(8);
   new DataView(nonceBuf.buffer).setBigUint64(0, verdict.nonce, true);
 
+  if (verdict.payloadHash.length !== 32) {
+    throw new Error('Invalid payloadHash length: must be exactly 32 bytes');
+  }
+
   const pathBytes = utf8ToBytes(verdict.derivationPath);
-  const pathLen = new Uint8Array(4);
-  new DataView(pathLen.buffer).setUint32(0, pathBytes.length, true);
+
+  if (verdict.policyHash.length !== 32) {
+    throw new Error('Invalid policyHash length: must be exactly 32 bytes');
+  }
 
   const totalLength =
     4 + domainBytes.length +
     8 +
     32 +
-    4 + pathBytes.length +
+    pathBytes.length +
     32;
 
   const result = new Uint8Array(totalLength);
@@ -64,17 +83,36 @@ export function serializeVerdict(verdict: VerdictPayload): Uint8Array {
   result.set(domainBytes, offset); offset += domainBytes.length;
   result.set(nonceBuf, offset); offset += 8;
   result.set(verdict.payloadHash, offset); offset += 32;
-  result.set(pathLen, offset); offset += 4;
   result.set(pathBytes, offset); offset += pathBytes.length;
   result.set(verdict.policyHash, offset); offset += 32;
 
   return result;
 }
 
-export function verifyEvmPayloadHash(txFields: { nonce: number; gasPrice: string; to: string; value: string; data: string }, expectedHash: Uint8Array): boolean {
-  if (!txFields.to || !txFields.value) return false;
-  const serialized = utf8ToBytes(JSON.stringify(txFields));
-  const calculated = sha256(serialized);
-  if (calculated.length !== expectedHash.length) return false;
-  return calculated.every((val, idx) => val === expectedHash[idx]);
+export function verifyEvmPayloadHash(
+  txFields: { nonce: number; gasPrice?: string; maxFeePerGas?: string; to: string; value: string; data?: string; chainId: number },
+  payloadHashHex: string
+): boolean {
+  if (!txFields.to || !txFields.value || txFields.nonce === undefined) {
+    throw new Error('Rejecting malformed EVM transaction: missing required fields');
+  }
+  if (!payloadHashHex || typeof payloadHashHex !== 'string') {
+    throw new Error('Rejecting malformed payload hash');
+  }
+
+  const canonicalString = JSON.stringify({
+    nonce: txFields.nonce,
+    gasPrice: txFields.gasPrice || txFields.maxFeePerGas || '0',
+    to: txFields.to,
+    value: txFields.value,
+    data: txFields.data || '0x',
+    chainId: txFields.chainId,
+  });
+
+  const computedHash = sha256(utf8ToBytes(canonicalString));
+  const cleanHex = payloadHashHex.startsWith('0x') ? payloadHashHex.slice(2) : payloadHashHex;
+  const expectedBytes = hexToBytes(cleanHex);
+
+  if (computedHash.length !== expectedBytes.length) return false;
+  return computedHash.every((val, idx) => val === expectedBytes[idx]);
 }

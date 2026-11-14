@@ -1,41 +1,12 @@
-import { serializeVerdict, hashPolicy, VerdictPayload, PolicyConfig } from './serializer';
-import { sha256 } from '@noble/hashes/sha256';
-import { utf8ToBytes, hexToBytes } from '@noble/hashes/utils';
+import { serializeVerdict, hashPolicy, VerdictPayload, PolicyConfig, verifyEvmPayloadHash } from './verifier';
 import { ec as EC } from 'elliptic';
+import { hexToBytes } from '@noble/hashes/utils';
 
 const ec = new EC('secp256k1');
 
 export interface ContractConfig {
   verifier_pk: string;
   is_paused: boolean;
-}
-
-export function verifyEvmPayloadHash(
-  txFields: { nonce: number; gasPrice?: string; maxFeePerGas?: string; to: string; value: string; data?: string; chainId: number },
-  payloadHashHex: string
-): boolean {
-  if (!txFields.to || !txFields.value || txFields.nonce === undefined) {
-    throw new Error('Rejecting malformed EVM transaction: missing required fields');
-  }
-  if (!payloadHashHex || typeof payloadHashHex !== 'string') {
-    throw new Error('Rejecting malformed payload hash');
-  }
-
-  const canonicalString = JSON.stringify({
-    nonce: txFields.nonce,
-    gasPrice: txFields.gasPrice || txFields.maxFeePerGas || '0',
-    to: txFields.to,
-    value: txFields.value,
-    data: txFields.data || '0x',
-    chainId: txFields.chainId,
-  });
-
-  const computedHash = sha256(utf8ToBytes(canonicalString));
-  const cleanHex = payloadHashHex.startsWith('0x') ? payloadHashHex.slice(2) : payloadHashHex;
-  const expectedBytes = hexToBytes(cleanHex);
-
-  if (computedHash.length !== expectedBytes.length) return false;
-  return computedHash.every((val, idx) => val === expectedBytes[idx]);
 }
 
 export async function signVerdict(
@@ -54,18 +25,18 @@ export async function signVerdict(
     throw new Error('Refusing to sign: Contract is currently paused.');
   }
 
-  // 2. Remove ADMIN_PRIVATE_KEY / PRIVATE_KEY fallbacks. Require SENTRY_PRIVATE_KEY exclusively.
+  // 2. Remove ADMIN_PRIVATE_KEY and PRIVATE_KEY fallbacks. Require SENTRY_PRIVATE_KEY exclusively.
   if (!env.SENTRY_PRIVATE_KEY) {
     throw new Error('Missing required environment variable: SENTRY_PRIVATE_KEY');
   }
 
-  // 3. Require explicit eth,<chain-id> derivation path. Reject NEAR defaults.
+  // 3. Require explicit eth,<chain-id> derivation path.
   const pathRegex = /^eth,\d+$/;
   if (!pathRegex.test(input.derivationPath)) {
-    throw new Error(`Invalid derivation path "${input.derivationPath}". Must be explicit format "eth,<chain-id>".`);
+    throw new Error(`Invalid derivation path "${input.derivationPath}". Must follow format "eth,<chain-id>".`);
   }
 
-  // 4. Compare derived public key against BOTH verifier_pk and SENTRY_EXPECTED_PUBLIC_KEY
+  // 4. Compare derived public key against BOTH SENTRY_EXPECTED_PUBLIC_KEY and live verifier_pk. Refuse on any mismatch.
   const keyPair = ec.keyFromPrivate(env.SENTRY_PRIVATE_KEY, 'hex');
   const derivedPubKey = keyPair.getPublic('hex');
 
@@ -77,11 +48,11 @@ export async function signVerdict(
     throw new Error(`Verifier key mismatch against SENTRY_EXPECTED_PUBLIC_KEY: expected ${env.SENTRY_EXPECTED_PUBLIC_KEY}, got ${derivedPubKey}`);
   }
 
-  // 5. Verify payload hash and EVM transaction fields if provided
+  // 5. Validate payload hash and EVM transaction canonical digest
   const cleanHex = input.payloadHashHex.startsWith('0x') ? input.payloadHashHex.slice(2) : input.payloadHashHex;
   const payloadHashBytes = hexToBytes(cleanHex);
   if (payloadHashBytes.length !== 32) {
-    throw new Error('Invalid payloadHash length: must be 32 bytes');
+    throw new Error('Invalid payloadHash length: must be exactly 32 bytes');
   }
 
   if (input.txFields) {
@@ -91,7 +62,7 @@ export async function signVerdict(
     }
   }
 
-  // 6. Build canonical verdict and sign exact Rust-compatible message bytes
+  // 6. Build canonical verdict and sign exact message bytes matching Rust
   const policyHash = hashPolicy(input.policy);
   const verdictPayload: VerdictPayload = {
     domain: 'TRIPWIRE_V1',
@@ -110,4 +81,8 @@ export async function signVerdict(
     messageBytes: Buffer.from(messageBytes).toString('hex'),
     policyHashHex: Buffer.from(policyHash).toString('hex'),
   };
+}
+
+if (require.main === module) {
+  console.log('Tripwire Sentry CLI loaded successfully.');
 }
