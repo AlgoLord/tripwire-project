@@ -1,118 +1,165 @@
-import { sha256 } from '@noble/hashes/sha256';
-import { utf8ToBytes, hexToBytes } from '@noble/hashes/utils';
-import { ec as EC } from 'elliptic';
+import { keccak_256 } from '@noble/hashes/sha3';
+import { hexToBytes } from '@noble/hashes/utils';
 
-const ec = new EC('secp256k1');
-
-export interface PolicyConfig {
-  max_amount: string; // u128 as string
-  to_address: string;
+export interface EvmTxFields {
+  type?: number; // 0, 1, or 2
+  nonce: number | bigint;
+  gasPrice?: string | bigint;
+  maxPriorityFeePerGas?: string | bigint;
+  maxFeePerGas?: string | bigint;
+  gasLimit: string | bigint;
+  to: string; // 0x hex address
+  value: string | bigint;
+  data: string; // 0x hex data
+  chainId: number | bigint;
+  accessList?: Array<[string, string[]]>;
 }
 
-export interface VerdictPayload {
-  domain: string; // "TRIPWIRE_V1"
-  nonce: bigint; // u64
-  payloadHash: Uint8Array; // 32 bytes
-  derivationPath: string; // e.g., "eth,1"
-  policyHash: Uint8Array; // 32 bytes
+function rlpEncodeLength(length: number, offset: number): Uint8Array {
+  if (length < 56) {
+    return new Uint8Array([length + offset]);
+  } else {
+    const hexString = length.toString(16);
+    const lenBytes = hexToBytes(hexString.length % 2 === 0 ? hexString : '0' + hexString);
+    const res = new Uint8Array(1 + lenBytes.length);
+    res[0] = offset + 56 + lenBytes.length - 1;
+    res.set(lenBytes, 1);
+    return res;
+  }
+}
+
+function rlpEncodeItem(input: Uint8Array | Uint8Array[]): Uint8Array {
+  if (Array.isArray(input)) {
+    let payloadLen = 0;
+    for (const item of input) {
+      payloadLen += item.length;
+    }
+    const header = rlpEncodeLength(payloadLen, 192);
+    const res = new Uint8Array(header.length + payloadLen);
+    res.set(header, 0);
+    let offset = header.length;
+    for (const item of input) {
+      res.set(item, offset);
+      offset += item.length;
+    }
+    return res;
+  } else {
+    if (input.length === 1 && input[0] < 128) {
+      return input;
+    } else {
+      const header = rlpEncodeLength(input.length, 128);
+      const res = new Uint8Array(header.length + input.length);
+      res.set(header, 0);
+      res.set(input, header.length);
+      return res;
+    }
+  }
+}
+
+function numberToBytes(num: number | bigint): Uint8Array {
+  if (num === 0n || num === 0) return new Uint8Array(0);
+  let hex = num.toString(16);
+  if (hex.length % 2 !== 0) hex = '0' + hex;
+  return hexToBytes(hex);
+}
+
+function addressToBytes(addr: string): Uint8Array {
+  const clean = addr.startsWith('0x') ? addr.slice(2) : addr;
+  return hexToBytes(clean);
+}
+
+function dataToBytes(data: string): Uint8Array {
+  if (!data || data === '0x') return new Uint8Array(0);
+  const clean = data.startsWith('0x') ? data.slice(2) : data;
+  return hexToBytes(clean);
 }
 
 /**
- * Borsh serialization for PolicyConfig matching Rust contract byte-for-byte:
- * - max_amount: u128 (16 bytes, little-endian)
- * - to_address: String (4 bytes LE length + UTF-8 bytes)
+ * Computes canonical Keccak-256 EVM signing digest for Type 0, 1, and 2 transactions.
+ * Makes txFields mandatory and enforces strict digest verification.
  */
-export function serializePolicy(policy: PolicyConfig): Uint8Array {
-  const amountBuf = new Uint8Array(16);
-  const amtBig = BigInt(policy.max_amount);
-  for (let i = 0; i < 16; i++) {
-    amountBuf[i] = Number((amtBig >> BigInt(i * 8)) & BigInt(0xff));
-  }
-  const addrBytes = utf8ToBytes(policy.to_address);
-  const addrLenBuf = new Uint8Array(4);
-  new DataView(addrLenBuf.buffer).setUint32(0, addrBytes.length, true);
-
-  const combined = new Uint8Array(16 + 4 + addrBytes.length);
-  combined.set(amountBuf, 0);
-  combined.set(addrLenBuf, 16);
-  combined.set(addrBytes, 20);
-  return combined;
-}
-
-export function hashPolicy(policy: PolicyConfig): Uint8Array {
-  return sha256(serializePolicy(policy));
-}
-
-/**
- * Canonical Borsh verdict message serialization matching Rust contract:
- * - domain: String
- * - nonce: u64 (8 bytes LE)
- * - payload_hash: [u8; 32]
- * - derivation_path: String (raw UTF-8 bytes without string length prefix)
- * - policy_hash: [u8; 32]
- */
-export function serializeVerdict(verdict: VerdictPayload): Uint8Array {
-  const domainBytes = utf8ToBytes(verdict.domain);
-  const domainLen = new Uint8Array(4);
-  new DataView(domainLen.buffer).setUint32(0, domainBytes.length, true);
-
-  const nonceBuf = new Uint8Array(8);
-  new DataView(nonceBuf.buffer).setBigUint64(0, verdict.nonce, true);
-
-  if (verdict.payloadHash.length !== 32) {
-    throw new Error('Invalid payloadHash length: must be exactly 32 bytes');
+export function computeEvmTransactionDigest(tx: EvmTxFields): Uint8Array {
+  if (!tx || tx.nonce === undefined || !tx.to || tx.value === undefined || tx.chainId === undefined) {
+    throw new Error('Mandatory transaction fields missing for EVM digest verification.');
   }
 
-  const pathBytes = utf8ToBytes(verdict.derivationPath);
+  const txType = tx.type ?? 0;
 
-  if (verdict.policyHash.length !== 32) {
-    throw new Error('Invalid policyHash length: must be exactly 32 bytes');
+  if (txType === 0) {
+    // Legacy EIP-155: [nonce, gasPrice, gasLimit, to, value, data, chainId, 0, 0]
+    const items = [
+      numberToBytes(tx.nonce),
+      numberToBytes(tx.gasPrice || 0n),
+      numberToBytes(tx.gasLimit),
+      addressToBytes(tx.to),
+      numberToBytes(tx.value),
+      dataToBytes(tx.data),
+      numberToBytes(tx.chainId),
+      new Uint8Array(0),
+      new Uint8Array(0),
+    ];
+    const encoded = rlpEncodeItem(items);
+    return keccak_256(encoded);
+  } else if (txType === 1) {
+    // Access List (EIP-2930): 0x01 || rlp([chainId, nonce, gasPrice, gasLimit, to, value, data, accessList, yParity, r, s]) (unsigned excludes signatures)
+    const encodedList = (tx.accessList || []).map(([addr, storageKeys]) => [
+      addressToBytes(addr),
+      storageKeys.map(k => hexToBytes(k.startsWith('0x') ? k.slice(2) : k))
+    ]);
+    const items = [
+      numberToBytes(tx.chainId),
+      numberToBytes(tx.nonce),
+      numberToBytes(tx.gasPrice || 0n),
+      numberToBytes(tx.gasLimit),
+      addressToBytes(tx.to),
+      numberToBytes(tx.value),
+      dataToBytes(tx.data),
+      encodedList as any,
+    ];
+    const rlpEncoded = rlpEncodeItem(items);
+    const payload = new Uint8Array(1 + rlpEncoded.length);
+    payload[0] = 1;
+    payload.set(rlpEncoded, 1);
+    return keccak_256(payload);
+  } else if (txType === 2) {
+    // EIP-1559: 0x02 || rlp([chainId, nonce, maxPriorityFeePerGas, maxFeePerGas, gasLimit, to, value, data, accessList])
+    const encodedList = (tx.accessList || []).map(([addr, storageKeys]) => [
+      addressToBytes(addr),
+      storageKeys.map(k => hexToBytes(k.startsWith('0x') ? k.slice(2) : k))
+    ]);
+    const items = [
+      numberToBytes(tx.chainId),
+      numberToBytes(tx.nonce),
+      numberToBytes(tx.maxPriorityFeePerGas || 0n),
+      numberToBytes(tx.maxFeePerGas || 0n),
+      numberToBytes(tx.gasLimit),
+      addressToBytes(tx.to),
+      numberToBytes(tx.value),
+      dataToBytes(tx.data),
+      encodedList as any,
+    ];
+    const rlpEncoded = rlpEncodeItem(items);
+    const payload = new Uint8Array(1 + rlpEncoded.length);
+    payload[0] = 2;
+    payload.set(rlpEncoded, 1);
+    return keccak_256(payload);
+  } else {
+    throw new Error(`Unsupported transaction type: ${txType}`);
   }
-
-  const totalLength =
-    4 + domainBytes.length +
-    8 +
-    32 +
-    pathBytes.length +
-    32;
-
-  const result = new Uint8Array(totalLength);
-  let offset = 0;
-
-  result.set(domainLen, offset); offset += 4;
-  result.set(domainBytes, offset); offset += domainBytes.length;
-  result.set(nonceBuf, offset); offset += 8;
-  result.set(verdict.payloadHash, offset); offset += 32;
-  result.set(pathBytes, offset); offset += pathBytes.length;
-  result.set(verdict.policyHash, offset); offset += 32;
-
-  return result;
 }
 
-export function verifyEvmPayloadHash(
-  txFields: { nonce: number; gasPrice?: string; maxFeePerGas?: string; to: string; value: string; data?: string; chainId: number },
-  payloadHashHex: string
-): boolean {
-  if (!txFields.to || !txFields.value || txFields.nonce === undefined) {
-    throw new Error('Rejecting malformed EVM transaction: missing required fields');
+export function verifyEvmPayloadHash(txFields: EvmTxFields, payloadHashHex: string): boolean {
+  if (!txFields) {
+    throw new Error('txFields is mandatory for payload hash verification.');
   }
   if (!payloadHashHex || typeof payloadHashHex !== 'string') {
-    throw new Error('Rejecting malformed payload hash');
+    throw new Error('Invalid payload hash format.');
   }
 
-  const canonicalString = JSON.stringify({
-    nonce: txFields.nonce,
-    gasPrice: txFields.gasPrice || txFields.maxFeePerGas || '0',
-    to: txFields.to,
-    value: txFields.value,
-    data: txFields.data || '0x',
-    chainId: txFields.chainId,
-  });
-
-  const computedHash = sha256(utf8ToBytes(canonicalString));
+  const computedDigest = computeEvmTransactionDigest(txFields);
   const cleanHex = payloadHashHex.startsWith('0x') ? payloadHashHex.slice(2) : payloadHashHex;
   const expectedBytes = hexToBytes(cleanHex);
 
-  if (computedHash.length !== expectedBytes.length) return false;
-  return computedHash.every((val, idx) => val === expectedBytes[idx]);
+  if (computedDigest.length !== expectedBytes.length) return false;
+  return computedDigest.every((val, idx) => val === expectedBytes[idx]);
 }

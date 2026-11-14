@@ -1,11 +1,17 @@
-import { serializeVerdict, hashPolicy, VerdictPayload, PolicyConfig, verifyEvmPayloadHash } from './verifier';
-import { ec as EC } from 'elliptic';
-import { hexToBytes } from '@noble/hashes/utils';
+import * as ed from '@noble/ed25519';
+import { sha512 } from '@noble/hashes/sha512';
+import { hexToBytes, bytesToHex } from '@noble/hashes/utils';
+import { serializeVerdict, hashPolicy, PolicyConfig } from './serializer';
+import { verifyEvmPayloadHash, EvmTxFields } from './verifier';
+import * as dotenv from 'dotenv';
 
-const ec = new EC('secp256k1');
+dotenv.config();
+
+// Configure ed25519 sha512 sync implementation
+ed.etc.sha512Sync = (...m) => sha512(ed.etc.concatBytes(...m));
 
 export interface ContractConfig {
-  verifier_pk: string;
+  verifier_pk: string; // ed25519 public key (hex or ed25519:... format)
   is_paused: boolean;
 }
 
@@ -17,72 +23,119 @@ export async function signVerdict(
     payloadHashHex: string;
     derivationPath: string;
     policy: PolicyConfig;
-    txFields?: any;
+    txFields: EvmTxFields; // Mandatory
   }
 ) {
-  // 1. Refuse to sign if contract is paused
+  // 1. Check pause state
   if (contractConfig.is_paused) {
     throw new Error('Refusing to sign: Contract is currently paused.');
   }
 
-  // 2. Remove ADMIN_PRIVATE_KEY and PRIVATE_KEY fallbacks. Require SENTRY_PRIVATE_KEY exclusively.
+  // 2. Enforce strict SENTRY_PRIVATE_KEY (no fallback)
   if (!env.SENTRY_PRIVATE_KEY) {
     throw new Error('Missing required environment variable: SENTRY_PRIVATE_KEY');
   }
 
-  // 3. Require explicit eth,<chain-id> derivation path.
+  // 3. Enforce strict SENTRY_EXPECTED_PUBLIC_KEY
+  if (!env.SENTRY_EXPECTED_PUBLIC_KEY) {
+    throw new Error('Missing required environment variable: SENTRY_EXPECTED_PUBLIC_KEY');
+  }
+
+  // 4. Require explicit eth,<chain-id> derivation path
   const pathRegex = /^eth,\d+$/;
   if (!pathRegex.test(input.derivationPath)) {
-    throw new Error(`Invalid derivation path "${input.derivationPath}". Must follow format "eth,<chain-id>".`);
+    throw new Error(`Invalid derivation path "${input.derivationPath}". Must be explicit "eth,<chain-id>".`);
   }
 
-  // 4. Compare derived public key against BOTH SENTRY_EXPECTED_PUBLIC_KEY and live verifier_pk. Refuse on any mismatch.
-  const keyPair = ec.keyFromPrivate(env.SENTRY_PRIVATE_KEY, 'hex');
-  const derivedPubKey = keyPair.getPublic('hex');
+  // 5. Derive Ed25519 public key from private key
+  const cleanPrivKey = env.SENTRY_PRIVATE_KEY.startsWith('ed25519:')
+    ? env.SENTRY_PRIVATE_KEY.slice(8)
+    : env.SENTRY_PRIVATE_KEY;
+  const privBytes = hexToBytes(cleanPrivKey);
+  const derivedPubKeyBytes = await ed.getPublicKey(privBytes);
+  const derivedPubKeyHex = bytesToHex(derivedPubKeyBytes);
 
-  if (contractConfig.verifier_pk && contractConfig.verifier_pk !== derivedPubKey) {
-    throw new Error(`Verifier key mismatch against contract verifier_pk: expected ${contractConfig.verifier_pk}, got ${derivedPubKey}`);
+  // 6. Compare derived public key against BOTH SENTRY_EXPECTED_PUBLIC_KEY and contract verifier_pk
+  const cleanExpectedPub = env.SENTRY_EXPECTED_PUBLIC_KEY.startsWith('ed25519:')
+    ? env.SENTRY_EXPECTED_PUBLIC_KEY.slice(8)
+    : env.SENTRY_EXPECTED_PUBLIC_KEY;
+  const cleanContractPub = contractConfig.verifier_pk.startsWith('ed25519:')
+    ? contractConfig.verifier_pk.slice(8)
+    : contractConfig.verifier_pk;
+
+  if (derivedPubKeyHex !== cleanExpectedPub) {
+    throw new Error(`Verifier public key mismatch against SENTRY_EXPECTED_PUBLIC_KEY: expected ${cleanExpectedPub}, got ${derivedPubKeyHex}`);
   }
 
-  if (env.SENTRY_EXPECTED_PUBLIC_KEY && env.SENTRY_EXPECTED_PUBLIC_KEY !== derivedPubKey) {
-    throw new Error(`Verifier key mismatch against SENTRY_EXPECTED_PUBLIC_KEY: expected ${env.SENTRY_EXPECTED_PUBLIC_KEY}, got ${derivedPubKey}`);
+  if (cleanContractPub && derivedPubKeyHex !== cleanContractPub) {
+    throw new Error(`Verifier public key mismatch against live contract verifier_pk: expected ${cleanContractPub}, got ${derivedPubKeyHex}`);
   }
 
-  // 5. Validate payload hash and EVM transaction canonical digest
-  const cleanHex = input.payloadHashHex.startsWith('0x') ? input.payloadHashHex.slice(2) : input.payloadHashHex;
-  const payloadHashBytes = hexToBytes(cleanHex);
-  if (payloadHashBytes.length !== 32) {
-    throw new Error('Invalid payloadHash length: must be exactly 32 bytes');
+  // 7. Make txFields mandatory and verify EVM transaction digest
+  if (!input.txFields) {
+    throw new Error('Refusing to sign: txFields is mandatory and must not be skipped.');
+  }
+  const isValidTx = verifyEvmPayloadHash(input.txFields, input.payloadHashHex);
+  if (!isValidTx) {
+    throw new Error('EVM transaction canonical digest verification failed against payloadHashHex.');
   }
 
-  if (input.txFields) {
-    const isValidTx = verifyEvmPayloadHash(input.txFields, input.payloadHashHex);
-    if (!isValidTx) {
-      throw new Error('EVM transaction payload hash verification failed');
-    }
-  }
-
-  // 6. Build canonical verdict and sign exact message bytes matching Rust
+  // 8. Serialize policy, hash, and build exact Rust-compatible verdict message
   const policyHash = hashPolicy(input.policy);
-  const verdictPayload: VerdictPayload = {
-    domain: 'TRIPWIRE_V1',
+  const verdictPayload = {
     nonce: input.nonce,
-    payloadHash: payloadHashBytes,
+    payloadHash: hexToBytes(input.payloadHashHex.startsWith('0x') ? input.payloadHashHex.slice(2) : input.payloadHashHex),
     derivationPath: input.derivationPath,
     policyHash,
   };
 
   const messageBytes = serializeVerdict(verdictPayload);
-  const msgHash = ec.hash().update(messageBytes).digest();
-  const signature = keyPair.sign(msgHash);
+  
+  // 9. Produce 64-byte Ed25519 signature expected by Rust env::ed25519_verify
+  const signatureBytes = await ed.signAsync(messageBytes, privBytes);
 
   return {
-    signature: Buffer.from(signature.toDER()).toString('hex'),
-    messageBytes: Buffer.from(messageBytes).toString('hex'),
-    policyHashHex: Buffer.from(policyHash).toString('hex'),
+    signature: bytesToHex(signatureBytes),
+    messageBytes: bytesToHex(messageBytes),
+    policyHashHex: bytesToHex(policyHash),
   };
 }
 
+// Execute CLI when run directly via npm run sign
 if (require.main === module) {
-  console.log('Tripwire Sentry CLI loaded successfully.');
+  (async () => {
+    try {
+      console.log('Executing Tripwire Sentry CLI...');
+      const mockConfig: ContractConfig = {
+        verifier_pk: process.env.SENTRY_EXPECTED_PUBLIC_KEY || '',
+        is_paused: false,
+      };
+      const mockPolicy: PolicyConfig = {
+        max_eth_transfer: '1000000000000000000',
+        allowed_delegates: [],
+        forbidden_spenders: [],
+      };
+      const mockTx = { type: 0, nonce: 0, gasPrice: '20000000000', gasLimit: '21000', to: '0x1234567890abcdef1234567890abcdef12345678', value: '100', chainId: 1, data: '0x' };
+      const dummyHash = '0x' + Buffer.from(require('./verifier').computeEvmTransactionDigest(mockTx)).toString('hex');
+
+      const result = await signVerdict(
+        mockConfig,
+        {
+          SENTRY_PRIVATE_KEY: process.env.SENTRY_PRIVATE_KEY,
+          SENTRY_EXPECTED_PUBLIC_KEY: process.env.SENTRY_EXPECTED_PUBLIC_KEY,
+        },
+        {
+          nonce: 1n,
+          payloadHashHex: dummyHash,
+          derivationPath: 'eth,1',
+          policy: mockPolicy,
+          txFields: mockTx,
+        }
+      );
+      console.log('Signature generated successfully:', result);
+    } catch (err: any) {
+      console.error('CLI signing failed:', err.message);
+      process.exit(1);
+    }
+  })();
 }
