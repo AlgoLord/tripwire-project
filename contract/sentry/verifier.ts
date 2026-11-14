@@ -3,15 +3,15 @@ import { hexToBytes } from '@noble/hashes/utils';
 
 export interface EvmTxFields {
   type?: number; // 0, 1, or 2
-  nonce: number | bigint;
-  gasPrice?: string | bigint;
-  maxPriorityFeePerGas?: string | bigint;
-  maxFeePerGas?: string | bigint;
-  gasLimit: string | bigint;
+  nonce: number | bigint | string;
+  gasPrice?: string | bigint | number;
+  maxPriorityFeePerGas?: string | bigint | number;
+  maxFeePerGas?: string | bigint | number;
+  gasLimit: string | bigint | number;
   to: string; // 0x hex address
-  value: string | bigint;
+  value: string | bigint | number;
   data: string; // 0x hex data
-  chainId: number | bigint;
+  chainId: number | bigint | string;
   accessList?: Array<[string, string[]]>;
 }
 
@@ -56,9 +56,18 @@ function rlpEncodeItem(input: Uint8Array | Uint8Array[]): Uint8Array {
   }
 }
 
-function numberToBytes(num: number | bigint): Uint8Array {
-  if (num === 0n || num === 0) return new Uint8Array(0);
-  let hex = num.toString(16);
+function numberToBytes(num: number | bigint | string | undefined): Uint8Array {
+  if (num === undefined || num === null || num === 0 || num === 0n || num === '0' || num === '0x0') {
+    return new Uint8Array(0);
+  }
+  let bigVal: bigint;
+  if (typeof num === 'string') {
+    bigVal = num.startsWith('0x') ? BigInt(num) : BigInt(num);
+  } else {
+    bigVal = BigInt(num);
+  }
+  if (bigVal === 0n) return new Uint8Array(0);
+  let hex = bigVal.toString(16);
   if (hex.length % 2 !== 0) hex = '0' + hex;
   return hexToBytes(hex);
 }
@@ -76,7 +85,6 @@ function dataToBytes(data: string): Uint8Array {
 
 /**
  * Computes canonical Keccak-256 EVM signing digest for Type 0, 1, and 2 transactions.
- * Makes txFields mandatory and enforces strict digest verification.
  */
 export function computeEvmTransactionDigest(tx: EvmTxFields): Uint8Array {
   if (!tx || tx.nonce === undefined || !tx.to || tx.value === undefined || tx.chainId === undefined) {
@@ -86,7 +94,6 @@ export function computeEvmTransactionDigest(tx: EvmTxFields): Uint8Array {
   const txType = tx.type ?? 0;
 
   if (txType === 0) {
-    // Legacy EIP-155: [nonce, gasPrice, gasLimit, to, value, data, chainId, 0, 0]
     const items = [
       numberToBytes(tx.nonce),
       numberToBytes(tx.gasPrice || 0n),
@@ -101,7 +108,6 @@ export function computeEvmTransactionDigest(tx: EvmTxFields): Uint8Array {
     const encoded = rlpEncodeItem(items);
     return keccak_256(encoded);
   } else if (txType === 1) {
-    // Access List (EIP-2930): 0x01 || rlp([chainId, nonce, gasPrice, gasLimit, to, value, data, accessList, yParity, r, s]) (unsigned excludes signatures)
     const encodedList = (tx.accessList || []).map(([addr, storageKeys]) => [
       addressToBytes(addr),
       storageKeys.map(k => hexToBytes(k.startsWith('0x') ? k.slice(2) : k))
@@ -122,7 +128,6 @@ export function computeEvmTransactionDigest(tx: EvmTxFields): Uint8Array {
     payload.set(rlpEncoded, 1);
     return keccak_256(payload);
   } else if (txType === 2) {
-    // EIP-1559: 0x02 || rlp([chainId, nonce, maxPriorityFeePerGas, maxFeePerGas, gasLimit, to, value, data, accessList])
     const encodedList = (tx.accessList || []).map(([addr, storageKeys]) => [
       addressToBytes(addr),
       storageKeys.map(k => hexToBytes(k.startsWith('0x') ? k.slice(2) : k))
