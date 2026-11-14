@@ -1,55 +1,112 @@
-import { serializePolicy, hashPolicy, serializeVerdict } from './verifier';
-import { signVerdict } from './sentry-cli';
+import { serializePolicy, hashPolicy, serializeVerdict } from './serializer';
+import { signVerdict, verifyEvmPayloadHash } from './sentry-cli';
+import { ec as EC } from 'elliptic';
+import { hexToBytes } from '@noble/hashes/utils';
 
-describe('Tripwire Sentry Comprehensive Audit Test Suite', () => {
-  const mockPolicy = { max_amount: '1000000000000000000', to_address: '0x1234...5678' };
-  const dummyPrivateKey = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
-  const dummyPubKey = '0479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8';
+const ec = new EC('secp256k1');
 
-  test('Canonical Borsh policy serialization is deterministic', () => {
-    const s1 = serializePolicy(mockPolicy);
-    const s2 = serializePolicy(mockPolicy);
-    expect(s1).toEqual(s2);
-  });
+async function runTests() {
+  console.log('Running Tripwire Sentry audit test suite...');
 
-  test('Rejects invalid derivation paths not matching eth,<chain-id>', async () => {
-    await expect(
-      signVerdict(
-        { verifier_pk: dummyPubKey, is_paused: false },
-        { SENTRY_PRIVATE_KEY: dummyPrivateKey },
-        { nonce: 1n, payloadHash: new Uint8Array(32), derivationPath: 'near,v3.tripwire-admin.testnet', policy: mockPolicy }
-      )
-    ).rejects.toThrow(/Invalid derivation path/);
-  });
+  const mockPolicy = { max_amount: '1000000000000000000', to_address: '0x1234567890abcdef1234567890abcdef12345678' };
+  const testPrivateKey = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
+  const keyPair = ec.keyFromPrivate(testPrivateKey, 'hex');
+  const validPubKey = keyPair.getPublic('hex');
+  const dummyPayloadHashHex = 'a1b2c3d4e5f678901234567890abcdef1234567890abcdef1234567890abcdef';
 
-  test('Refuses to sign when contract is paused', async () => {
-    await expect(
-      signVerdict(
-        { verifier_pk: dummyPubKey, is_paused: true },
-        { SENTRY_PRIVATE_KEY: dummyPrivateKey },
-        { nonce: 1n, payloadHash: new Uint8Array(32), derivationPath: 'eth,1', policy: mockPolicy }
-      )
-    ).rejects.toThrow(/Contract is currently paused/);
-  });
+  // 1. Policy serialization Borsh format test
+  const s1 = serializePolicy(mockPolicy);
+  const s2 = serializePolicy(mockPolicy);
+  if (s1.length !== 16 + 4 + mockPolicy.to_address.length || s1.toString() !== s2.toString()) {
+    throw new Error('Test 1 failed: Borsh policy serialization mismatch');
+  }
+  console.log('✓ Canonical Borsh policy serialization test passed!');
 
-  test('Enforces strict SENTRY_PRIVATE_KEY and rejects missing keys', async () => {
-    await expect(
-      signVerdict(
-        { verifier_pk: dummyPubKey, is_paused: false },
-        {},
-        { nonce: 1n, payloadHash: new Uint8Array(32), derivationPath: 'eth,1', policy: mockPolicy }
-      )
-    ).rejects.toThrow(/Missing required environment variable/);
-  });
+  // 2. Verdict message bytes Borsh structure test
+  const pHash = hashPolicy(mockPolicy);
+  const verdict = {
+    domain: 'TRIPWIRE_V1',
+    nonce: 1n,
+    payloadHash: hexToBytes(dummyPayloadHashHex),
+    derivationPath: 'eth,1',
+    policyHash: pHash,
+  };
+  const msgBytes = serializeVerdict(verdict);
+  if (msgBytes.length <= 64) {
+    throw new Error('Test 2 failed: Invalid verdict message length');
+  }
+  console.log('✓ Verdict message byte structure test passed!');
 
-  test('Rejects verifier public key mismatch', async () => {
-    const wrongPubKey = '0400000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000';
-    await expect(
-      signVerdict(
-        { verifier_pk: wrongPubKey, is_paused: false },
-        { SENTRY_PRIVATE_KEY: dummyPrivateKey },
-        { nonce: 1n, payloadHash: new Uint8Array(32), derivationPath: 'eth,1', policy: mockPolicy }
-      )
-    ).rejects.toThrow(/Verifier key mismatch/);
-  });
+  // 3. Rejects invalid derivation paths
+  try {
+    await signVerdict(
+      { verifier_pk: validPubKey, is_paused: false },
+      { SENTRY_PRIVATE_KEY: testPrivateKey },
+      { nonce: 1n, payloadHashHex: dummyPayloadHashHex, derivationPath: 'near,v3.tripwire-admin.testnet', policy: mockPolicy }
+    );
+    throw new Error('Test 3 failed: Should have rejected NEAR path');
+  } catch (e: any) {
+    if (!e.message.includes('Invalid derivation path')) throw e;
+  }
+  console.log('✓ Rejects invalid derivation paths test passed!');
+
+  // 4. Refuses to sign when contract is paused
+  try {
+    await signVerdict(
+      { verifier_pk: validPubKey, is_paused: true },
+      { SENTRY_PRIVATE_KEY: testPrivateKey },
+      { nonce: 1n, payloadHashHex: dummyPayloadHashHex, derivationPath: 'eth,1', policy: mockPolicy }
+    );
+    throw new Error('Test 4 failed: Should have refused paused contract');
+  } catch (e: any) {
+    if (!e.message.includes('Contract is currently paused')) throw e;
+  }
+  console.log('✓ Refuses to sign when contract is paused test passed!');
+
+  // 5. Enforces strict SENTRY_PRIVATE_KEY
+  try {
+    await signVerdict(
+      { verifier_pk: validPubKey, is_paused: false },
+      {},
+      { nonce: 1n, payloadHashHex: dummyPayloadHashHex, derivationPath: 'eth,1', policy: mockPolicy }
+    );
+    throw new Error('Test 5 failed: Should have rejected missing private key');
+  } catch (e: any) {
+    if (!e.message.includes('Missing required environment variable')) throw e;
+  }
+  console.log('✓ Enforces strict SENTRY_PRIVATE_KEY test passed!');
+
+  // 6. Rejects verifier public key mismatch
+  const wrongKey = '0400000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000';
+  try {
+    await signVerdict(
+      { verifier_pk: wrongKey, is_paused: false },
+      { SENTRY_PRIVATE_KEY: testPrivateKey },
+      { nonce: 1n, payloadHashHex: dummyPayloadHashHex, derivationPath: 'eth,1', policy: mockPolicy }
+    );
+    throw new Error('Test 6 failed: Should have rejected key mismatch');
+  } catch (e: any) {
+    if (!e.message.includes('Verifier key mismatch')) throw e;
+  }
+  console.log('✓ Rejects verifier public key mismatch test passed!');
+
+  // 7. Rejects malformed payload hashes
+  const tx = { nonce: 0, gasPrice: '20000000000', to: '0x1234...5678', value: '100', chainId: 1 };
+  let threw = false;
+  try {
+    verifyEvmPayloadHash(tx, 'invalid-hash');
+  } catch {
+    threw = true;
+  }
+  if (!threw) {
+    throw new Error('Test 7 failed: Should have rejected malformed hash');
+  }
+  console.log('✓ Rejects malformed payload hashes test passed!');
+
+  console.log('\nTripwire verifier audit test suite passed successfully.');
+}
+
+runTests().catch(err => {
+  console.error('❌ Test failed:', err.message);
+  process.exit(1);
 });

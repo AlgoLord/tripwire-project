@@ -11,17 +11,21 @@ export interface VerdictPayload {
   nonce: bigint; // u64
   payloadHash: Uint8Array; // 32 bytes
   derivationPath: string; // e.g., "eth,1"
-  policyHash: Uint8Array; // 32 bytes SHA-256 of policy config
+  policyHash: Uint8Array; // 32 bytes SHA-256 of PolicyConfig
 }
 
+/**
+ * Borsh serialization for PolicyConfig matching Rust contract:
+ * - max_amount: u128 (16 bytes, little-endian)
+ * - to_address: String (4 bytes LE length + UTF-8 bytes)
+ */
 export function serializePolicy(policy: PolicyConfig): Uint8Array {
-  // Simple deterministic Borsh serialization for PolicyConfig
-  // u128 max_amount (16 bytes LE) + string to_address (4 bytes len + utf8)
   const amountBuf = new Uint8Array(16);
   const amtBig = BigInt(policy.max_amount);
   for (let i = 0; i < 16; i++) {
     amountBuf[i] = Number((amtBig >> BigInt(i * 8)) & BigInt(0xff));
   }
+
   const addrBytes = utf8ToBytes(policy.to_address);
   const addrLenBuf = new Uint8Array(4);
   new DataView(addrLenBuf.buffer).setUint32(0, addrBytes.length, true);
@@ -37,27 +41,40 @@ export function hashPolicy(policy: PolicyConfig): Uint8Array {
   return sha256(serializePolicy(policy));
 }
 
+/**
+ * Canonical Borsh verdict message serialization matching Rust contract:
+ * - domain: String
+ * - nonce: u64 (8 bytes LE)
+ * - payload_hash: [u8; 32]
+ * - derivation_path: String
+ * - policy_hash: [u8; 32]
+ */
 export function serializeVerdict(verdict: VerdictPayload): Uint8Array {
   const domainBytes = utf8ToBytes(verdict.domain);
   const domainLen = new Uint8Array(4);
   new DataView(domainLen.buffer).setUint32(0, domainBytes.length, true);
 
-  // Nonce: 8 bytes LE (u64)
   const nonceBuf = new Uint8Array(8);
   new DataView(nonceBuf.buffer).setBigUint64(0, verdict.nonce, true);
 
-  // Derivation path string
+  if (verdict.payloadHash.length !== 32) {
+    throw new Error('Invalid payloadHash length: must be exactly 32 bytes');
+  }
+
   const pathBytes = utf8ToBytes(verdict.derivationPath);
   const pathLen = new Uint8Array(4);
   new DataView(pathLen.buffer).setUint32(0, pathBytes.length, true);
 
-  // Concatenate components in canonical Borsh order
+  if (verdict.policyHash.length !== 32) {
+    throw new Error('Invalid policyHash length: must be exactly 32 bytes');
+  }
+
   const totalLength =
     4 + domainBytes.length +
     8 +
-    32 + // payloadHash
+    32 +
     4 + pathBytes.length +
-    32;  // policyHash
+    32;
 
   const result = new Uint8Array(totalLength);
   let offset = 0;
