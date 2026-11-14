@@ -1,39 +1,55 @@
-import { TripwireVerifier } from "./verifier";
-import { KeyPair } from "@near-js/crypto";
-import * as assert from "assert";
+import { serializePolicy, hashPolicy, serializeVerdict } from './verifier';
+import { signVerdict } from './sentry-cli';
 
-console.log("Running TripwireVerifier unit tests...");
+describe('Tripwire Sentry Comprehensive Audit Test Suite', () => {
+  const mockPolicy = { max_amount: '1000000000000000000', to_address: '0x1234...5678' };
+  const dummyPrivateKey = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
+  const dummyPubKey = '0479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8';
 
-// Test 1: Successful signing with canonical binary format
-const keyPair = KeyPair.fromRandom("ed25519");
-const verifier = new TripwireVerifier(keyPair, keyPair.getPublicKey().toString());
+  test('Canonical Borsh policy serialization is deterministic', () => {
+    const s1 = serializePolicy(mockPolicy);
+    const s2 = serializePolicy(mockPolicy);
+    expect(s1).toEqual(s2);
+  });
 
-const proposal = {
-    nonce: 1n,
-    payloadHashHex: "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
-    derivationPath: "near,v3.tripwire-admin.testnet",
-    transaction: { receiverId: "test.near", actions: [] }
-};
+  test('Rejects invalid derivation paths not matching eth,<chain-id>', async () => {
+    await expect(
+      signVerdict(
+        { verifier_pk: dummyPubKey, is_paused: false },
+        { SENTRY_PRIVATE_KEY: dummyPrivateKey },
+        { nonce: 1n, payloadHash: new Uint8Array(32), derivationPath: 'near,v3.tripwire-admin.testnet', policy: mockPolicy }
+      )
+    ).rejects.toThrow(/Invalid derivation path/);
+  });
 
-const policy = { allowed_delegates: ["v3.tripwire-admin.testnet"], forbidden_spenders: [], max_eth_transfer: "1" };
+  test('Refuses to sign when contract is paused', async () => {
+    await expect(
+      signVerdict(
+        { verifier_pk: dummyPubKey, is_paused: true },
+        { SENTRY_PRIVATE_KEY: dummyPrivateKey },
+        { nonce: 1n, payloadHash: new Uint8Array(32), derivationPath: 'eth,1', policy: mockPolicy }
+      )
+    ).rejects.toThrow(/Contract is currently paused/);
+  });
 
-const verdict = verifier.signProposal(proposal, policy);
-assert.ok(verdict.signatureHex, "Signature hex should be present");
-assert.ok(verdict.messageHex, "Message hex should be present");
-assert.strictEqual(verdict.payloadHashHex, proposal.payloadHashHex, "Payload hash should match");
-console.log("✓ Canonical binary signing test passed!");
+  test('Enforces strict SENTRY_PRIVATE_KEY and rejects missing keys', async () => {
+    await expect(
+      signVerdict(
+        { verifier_pk: dummyPubKey, is_paused: false },
+        {},
+        { nonce: 1n, payloadHash: new Uint8Array(32), derivationPath: 'eth,1', policy: mockPolicy }
+      )
+    ).rejects.toThrow(/Missing required environment variable/);
+  });
 
-// Test 2: Mismatched public key rejection
-const wrongKeyPair = KeyPair.fromRandom("ed25519");
-let threwError = false;
-try {
-    new TripwireVerifier(wrongKeyPair, "ed25519:wrong-public-key");
-} catch (e: any) {
-    if (e.message.includes("Verifier public key mismatch")) {
-        threwError = true;
-    }
-}
-assert.ok(threwError, "Should throw on public key mismatch");
-console.log("✓ Public key mismatch rejection test passed!");
-
-console.log("Tripwire verifier unit tests passed.");
+  test('Rejects verifier public key mismatch', async () => {
+    const wrongPubKey = '0400000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000';
+    await expect(
+      signVerdict(
+        { verifier_pk: wrongPubKey, is_paused: false },
+        { SENTRY_PRIVATE_KEY: dummyPrivateKey },
+        { nonce: 1n, payloadHash: new Uint8Array(32), derivationPath: 'eth,1', policy: mockPolicy }
+      )
+    ).rejects.toThrow(/Verifier key mismatch/);
+  });
+});

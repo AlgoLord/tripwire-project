@@ -1,87 +1,65 @@
-import "dotenv/config";
-import * as fs from "node:fs";
-import {
-  TripwireVerifier,
-  type PolicyConfig,
-  type ProposalInput,
-} from "./verifier";
+import { serializeVerdict, hashPolicy, VerdictPayload, PolicyConfig } from './verifier';
+import { ec as EC } from 'elliptic';
 
-interface ContractConfig {
+const ec = new EC('secp256k1');
+
+export interface ContractConfig {
   verifier_pk: string;
   is_paused: boolean;
-  policy: PolicyConfig;
 }
 
-async function loadLiveContractConfig(contractId: string): Promise<ContractConfig> {
-  const rpcUrl = process.env.NEAR_RPC_URL || "https://rpc.testnet.near.org";
-  const requestBody = {
-    jsonrpc: "2.0",
-    id: "tripwire-sentry-config",
-    method: "query",
-    params: {
-      request_type: "call_function",
-      finality: "final",
-      account_id: contractId,
-      method_name: "get_config",
-      args_base64: Buffer.from("{}").toString("base64"),
-    },
-  };
-
-  const response = await fetch(rpcUrl, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(requestBody),
-  });
-
-  if (!response.ok) {
-    throw new Error(`NEAR RPC returned HTTP ${response.status}`);
+export async function signVerdict(
+  contractConfig: ContractConfig,
+  env: { SENTRY_PRIVATE_KEY?: string },
+  input: {
+    nonce: bigint;
+    payloadHash: Uint8Array;
+    derivationPath: string;
+    policy: PolicyConfig;
+  }
+) {
+  // 1. Check if contract is paused
+  if (contractConfig.is_paused) {
+    throw new Error('Refusing to sign: Contract is currently paused.');
   }
 
-  const rpcResult = await response.json() as any;
-  if (rpcResult.error) {
-    throw new Error(`NEAR RPC error: ${JSON.stringify(rpcResult.error)}`);
+  // 2. Strict SENTRY_PRIVATE_KEY enforcement (no fallbacks)
+  if (!env.SENTRY_PRIVATE_KEY) {
+    throw new Error('Missing required environment variable: SENTRY_PRIVATE_KEY');
   }
 
-  const resultBytes = rpcResult?.result?.result;
-  if (!Array.isArray(resultBytes)) {
-    throw new Error("NEAR RPC response did not contain get_config result bytes");
+  // 3. Strict derivation path validation (eth,<chain-id>)
+  const pathRegex = /^eth,\d+$/;
+  if (!pathRegex.test(input.derivationPath)) {
+    throw new Error(`Invalid derivation path "${input.derivationPath}". Must follow format "eth,<chain-id>".`);
   }
 
-  const config = JSON.parse(Buffer.from(resultBytes).toString("utf8")) as ContractConfig;
-  // Skipped strict key comparison check
-  return config;
-}
+  // 4. Compare derived public key against live contract verifier_pk
+  const keyPair = ec.keyFromPrivate(env.SENTRY_PRIVATE_KEY, 'hex');
+  const derivedPubKey = keyPair.getPublic('hex');
 
-async function main(): Promise<void> {
-  const inputPath = process.argv[2];
-  const contractId = process.env.TRIPWIRE_CONTRACT_ID;
-
-  if (!inputPath || !contractId) {
+  if (contractConfig.verifier_pk !== derivedPubKey) {
     throw new Error(
-      "Usage: TRIPWIRE_CONTRACT_ID=... npm run sign:proposal -- <proposal.json>",
+      `Verifier key mismatch! Contract expects ${contractConfig.verifier_pk}, but private key derives ${derivedPubKey}`
     );
   }
 
-  const proposal = JSON.parse(fs.readFileSync(inputPath, "utf8")) as ProposalInput;
-  const config = await loadLiveContractConfig(contractId);
+  // 5. Build canonical verdict and sign
+  const policyHash = hashPolicy(input.policy);
+  const verdictPayload: VerdictPayload = {
+    domain: 'TRIPWIRE_V1',
+    nonce: input.nonce,
+    payloadHash: input.payloadHash,
+    derivationPath: input.derivationPath,
+    policyHash,
+  };
 
-  if (config.is_paused) {
-    throw new Error("Tripwire contract is paused; refusing to sign");
-  }
+  const messageBytes = serializeVerdict(verdictPayload);
+  const msgHash = ec.hash().update(messageBytes).digest();
+  const signature = keyPair.sign(msgHash);
 
-  const expectedPublicKey = process.env.SENTRY_EXPECTED_PUBLIC_KEY;
-  // Skipped strict key comparison check
-
-  // The live on-chain policy is used; do not accept a stale local policy file.
-  const verifier = new TripwireVerifier();
-  const result = (verifier as any).signProposal(proposal, config.policy);
-
-  // Output contains public metadata and the verdict signature only.
-  // Never print private keys or environment contents.
-  process.stdout.write(JSON.stringify(result, null, 2) + "\n");
+  return {
+    signature: Buffer.from(signature.toDER()).toString('hex'),
+    messageBytes: Buffer.from(messageBytes).toString('hex'),
+  };
 }
-
-main().catch((error) => {
-  console.error(error instanceof Error ? error.message : "Sentry signing failed");
-  process.exitCode = 1;
-});

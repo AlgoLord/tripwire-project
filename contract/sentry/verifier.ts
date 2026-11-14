@@ -1,73 +1,80 @@
-import { KeyPair } from "@near-js/crypto";
-import * as dotenv from "dotenv";
-import * as crypto from "crypto";
+import { sha256 } from '@noble/hashes/sha256';
+import { utf8ToBytes } from '@noble/hashes/utils';
+import { ec as EC } from 'elliptic';
 
-dotenv.config();
+const ec = new EC('secp256k1');
 
-export type PolicyConfig = {
-    [key: string]: any;
-};
+export interface PolicyConfig {
+  max_amount: string; // u128 as string
+  to_address: string;
+}
 
-export type ProposalInput = {
-    nonce: number | bigint;
-    payloadHashHex?: string;
-    payload?: string;
-    derivationPath?: string;
-    transaction?: any;
-};
+export interface VerdictPayload {
+  domain: string; // "TRIPWIRE_V1"
+  nonce: bigint; // u64
+  payloadHash: Uint8Array; // 32 bytes
+  derivationPath: string; // e.g., "eth,1"
+  policyHash: Uint8Array; // 32 bytes
+}
 
-export class TripwireVerifier {
-    private keyPair: KeyPair;
-    private expectedPublicKey?: string;
+export function serializePolicy(policy: PolicyConfig): Uint8Array {
+  const amountBuf = new Uint8Array(16);
+  const amtBig = BigInt(policy.max_amount);
+  for (let i = 0; i < 16; i++) {
+    amountBuf[i] = Number((amtBig >> BigInt(i * 8)) & BigInt(0xff));
+  }
+  const addrBytes = utf8ToBytes(policy.to_address);
+  const addrLenBuf = new Uint8Array(4);
+  new DataView(addrLenBuf.buffer).setUint32(0, addrBytes.length, true);
 
-    constructor(keyPair?: KeyPair | string, expectedPublicKey?: string) {
-        if (typeof keyPair === "string") {
-            this.keyPair = KeyPair.fromString(keyPair as any);
-            this.expectedPublicKey = expectedPublicKey;
-        } else if (keyPair) {
-            this.keyPair = keyPair;
-            this.expectedPublicKey = expectedPublicKey;
-        } else {
-            const privateKey = process.env.SENTRY_PRIVATE_KEY || process.env.ADMIN_PRIVATE_KEY || process.env.PRIVATE_KEY;
-            if (!privateKey) {
-                throw new Error("SENTRY_PRIVATE_KEY is not defined in environment variables.");
-            }
-            this.keyPair = KeyPair.fromString(privateKey as any);
-        }
+  const combined = new Uint8Array(16 + 4 + addrBytes.length);
+  combined.set(amountBuf, 0);
+  combined.set(addrLenBuf, 16);
+  combined.set(addrBytes, 20);
+  return combined;
+}
 
-        if (this.expectedPublicKey && this.keyPair.getPublicKey().toString() !== this.expectedPublicKey) {
-            throw new Error("Verifier public key mismatch");
-        }
-    }
+export function hashPolicy(policy: PolicyConfig): Uint8Array {
+  return sha256(serializePolicy(policy));
+}
 
-    public signProposal(proposal: ProposalInput, policy: PolicyConfig): { signatureHex: string; messageHex: string; payloadHashHex: string } {
-        const nonceNum = BigInt(proposal.nonce ?? 1);
-        const nonceBuf = Buffer.alloc(8);
-        nonceBuf.writeBigUInt64LE(nonceNum);
+export function serializeVerdict(verdict: VerdictPayload): Uint8Array {
+  const domainBytes = utf8ToBytes(verdict.domain);
+  const domainLen = new Uint8Array(4);
+  new DataView(domainLen.buffer).setUint32(0, domainBytes.length, true);
 
-        const rawHash = proposal.payloadHashHex || proposal.payload || "0x0000000000000000000000000000000000000000000000000000000000000000";
-        const cleanHash = rawHash.replace(/^0x/, "");
-        const payloadHashBuf = Buffer.from(cleanHash, "hex");
+  const nonceBuf = new Uint8Array(8);
+  new DataView(nonceBuf.buffer).setBigUint64(0, verdict.nonce, true);
 
-        const derivationPath = proposal.derivationPath || "near,v3.tripwire-admin.testnet";
-        const derivationPathBuf = Buffer.from(derivationPath, "utf8");
-        
-        const policyJson = JSON.stringify(policy);
-        const policyHashBuf = crypto.createHash("sha256").update(policyJson).digest();
+  const pathBytes = utf8ToBytes(verdict.derivationPath);
+  const pathLen = new Uint8Array(4);
+  new DataView(pathLen.buffer).setUint32(0, pathBytes.length, true);
 
-        const message = Buffer.concat([
-            nonceBuf,
-            payloadHashBuf,
-            derivationPathBuf,
-            policyHashBuf
-        ]);
+  const totalLength =
+    4 + domainBytes.length +
+    8 +
+    32 +
+    4 + pathBytes.length +
+    32;
 
-        const signature = this.keyPair.sign(message);
+  const result = new Uint8Array(totalLength);
+  let offset = 0;
 
-        return {
-            signatureHex: Buffer.from(signature.signature).toString("hex"),
-            messageHex: message.toString("hex"),
-            payloadHashHex: rawHash,
-        };
-    }
+  result.set(domainLen, offset); offset += 4;
+  result.set(domainBytes, offset); offset += domainBytes.length;
+  result.set(nonceBuf, offset); offset += 8;
+  result.set(verdict.payloadHash, offset); offset += 32;
+  result.set(pathLen, offset); offset += 4;
+  result.set(pathBytes, offset); offset += pathBytes.length;
+  result.set(verdict.policyHash, offset); offset += 32;
+
+  return result;
+}
+
+export function verifyEvmPayloadHash(txFields: { nonce: number; gasPrice: string; to: string; value: string; data: string }, expectedHash: Uint8Array): boolean {
+  if (!txFields.to || !txFields.value) return false;
+  const serialized = utf8ToBytes(JSON.stringify(txFields));
+  const calculated = sha256(serialized);
+  if (calculated.length !== expectedHash.length) return false;
+  return calculated.every((val, idx) => val === expectedHash[idx]);
 }
