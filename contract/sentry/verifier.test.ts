@@ -1,5 +1,5 @@
-import { serializePolicy, hashPolicy, serializeVerdict } from './verifier';
-import { signVerdict, verifyEvmPayloadHash } from './sentry-cli';
+import { serializePolicy, hashPolicy, serializeVerdict, verifyEvmPayloadHash } from './verifier';
+import { signVerdict } from './sentry-cli';
 import { ec as EC } from 'elliptic';
 import { hexToBytes } from '@noble/hashes/utils';
 
@@ -63,7 +63,7 @@ async function runTests() {
   }
   console.log('✓ Refuses to sign when contract is paused test passed!');
 
-  // 5. Enforces strict SENTRY_PRIVATE_KEY (no ADMIN_PRIVATE_KEY/PRIVATE_KEY fallbacks)
+  // 5. Enforces strict SENTRY_PRIVATE_KEY (no fallbacks)
   try {
     await signVerdict(
       { verifier_pk: validPubKey, is_paused: false },
